@@ -4,13 +4,18 @@ import re
 import jieba
 import tensorflow as tf
 import numpy as np
+import time
+import math
 from tensorflow.python.keras.optimizers import adam
 from sklearn.utils import shuffle
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics import log_loss
+from sklearn.model_selection import train_test_split
 from tensorflow.python.keras.preprocessing import text
 from tensorflow.python.keras.preprocessing import sequence
 
 from cnn import cnn_model
+from timer import Timer
 
 from keras.backend.tensorflow_backend import set_session
 config = tf.ConfigProto()
@@ -23,9 +28,12 @@ sess = tf.Session(config=config)
 # set this TensorFlow session as the default session for Keras
 set_session(sess)
 
-IS_TEST = False
 MAX_SEQ_LENGTH = 500
 MAX_VOCAB_SIZE = 20000  # Limit the number of features. only top 20K features
+MAX_VOCAB_READ_FROM_EMBEDDING = 200000  # Limit number of wordvec load from dict
+MAX_VOCAB_STAT = 50000  # TODO
+BATCH_SIZE = 3000
+MAX_VALID_SIZE = 2000
 
 
 def clean_en_text(dat):
@@ -111,8 +119,14 @@ def ohe2cat(label):
     return np.argmax(label, axis=1)
 
 
+def user_log(text):
+    sp = time.time()
+    localtime = time.localtime(sp)
+    print("%s [USER LOG] %s" % (time.strftime("%Y-%m-%d %H:%M:%S", localtime), text))
+
+
 class Model(object):
-    """ 
+    """
         model of CNN baseline without pretraining.
         see `https://aclweb.org/anthology/D14-1181` for more information.
     """
@@ -137,6 +151,8 @@ class Model(object):
         self.max_length = None
         self.x_train = None
         self.y_train = None
+        self.x_valid = None
+        self.y_valid = None
         self.word_index = None
         self.num_features = None
         self.num_classes = None
@@ -144,11 +160,21 @@ class Model(object):
 
         self.initialized = False
 
+        self._now_batch_id = 0
+        self._batch_num = 0
+        self._loss_history = list()
+        self._train_10k = Timer()
+        self._test_all = Timer()
+        self._validate = Timer()
+        self._min_loss = 999999999.0
+        self._not_imporove_round = 0
+        user_log("__init__ done.")
+
     def initialize(self, train_dataset):
         # why not init in __init__() ?
         # cause word index process need train_dataset, so init step should run
         # in first training step
-
+        user_log("initialize start.")
         self.initialized = True
         self.x_train, self.y_train = train_dataset
 
@@ -175,11 +201,11 @@ class Model(object):
                              ' {unexpected_embedding}. '.format(
                                  unexpected_embedding=FT_DIR))
 
-        LOCALE_TEST_WORD_LIMIT = 50000
-        for line in f.readlines():
-            if IS_TEST and LOCALE_TEST_WORD_LIMIT <= 0:
+        vocab_count = 0
+        for line in f:
+            if vocab_count > MAX_VOCAB_READ_FROM_EMBEDDING:
                 break
-            LOCALE_TEST_WORD_LIMIT -= 1
+            vocab_count += 1
 
             values = line.strip().split()
             if self.metadata['language'] == 'ZH':
@@ -189,8 +215,8 @@ class Model(object):
             coefs = np.asarray(values[1:], dtype='float32')
             fasttext_embeddings_index[word] = coefs
 
-        print('Found %s fastText word vectors.' %
-              len(fasttext_embeddings_index))
+        user_log('Found %s fastText word vectors.' %
+                len(fasttext_embeddings_index))
         # embedding lookup
         EMBEDDING_DIM = 300
         self.embedding_matrix = np.zeros((self.num_features, EMBEDDING_DIM))
@@ -209,12 +235,18 @@ class Model(object):
                 cnt += 1
 
         self.x_train, self.y_train = shuffle(self.x_train, self.y_train)
-        print('fastText oov words: %s, correct words: %s' % (cnt, correct_cnt))
+        self.x_train, self.x_valid, self.y_train, self.y_valid = train_test_split(
+            self.x_train, self.y_train, test_size=0.2)
+        self._batch_num = math.ceil(len(self.x_train) / (BATCH_SIZE * 1.0))
+        self.x_train = [self.x_train[i*BATCH_SIZE:(i+1)*BATCH_SIZE] for i in range(self._batch_num)]
+        self.y_train = [self.y_train[i*BATCH_SIZE:(i+1)*BATCH_SIZE] for i in range(self._batch_num)]
+        user_log('fastText oov words: %s, correct words: %s, split to %d batch.'
+            % (cnt, correct_cnt, self._batch_num))
 
     def init_model(self):
         # initialize model
         self.model = cnn_model(
-            input_shape=self.x_train.shape[1:][0],
+            input_shape=self.x_train[0].shape[1:][0],
             num_classes=self.num_classes,
             num_features=self.num_features,
             embedding_matrix=self.embedding_matrix,
@@ -228,6 +260,51 @@ class Model(object):
         optimizer = adam(lr=1e-3)
         self.model.compile(optimizer=optimizer, loss=loss, metrics=['acc'])
 
+    def check_if_end(self):
+        if self._not_imporove_round >= 3:
+            self.done_training = True
+
+    def validate(self):
+        self._validate.start()
+        result = self.model.predict(self.x_valid[:MAX_VALID_SIZE])
+        loss = log_loss(self.y_valid[:MAX_VALID_SIZE], result)
+        self._loss_history.append(loss)
+        if loss < self._min_loss:
+            self._min_loss = loss
+            self._not_imporove_round = 0
+        else:
+            self._not_imporove_round += 1
+        self._validate.end()
+
+    def send_log(self):
+        user_log("============================================")
+        user_log("Train avg time %f." % (self._train_10k.avg()))
+        user_log("Test avg time %f." % (self._test_all.avg()))
+        user_log("Validate avg time %f." % (self._validate.avg()))
+        user_log("Min loss %f." % (self._min_loss))
+        user_log("Loss history %s." % (self._loss_history))
+        user_log("============================================")
+
+    def run_train(self):
+        self._train_10k.start()
+        # fit model
+        history = self.model.fit(
+            self.x_train[self._now_batch_id],
+            ohe2cat(self.y_train[self._now_batch_id]),
+            # y_train,
+            epochs=1,
+            verbose=2,  # Logs once per epoch.
+            batch_size=32,
+            shuffle=False)
+        user_log("train batch %d. size %s" % (self._now_batch_id,
+            str(self.y_train[self._now_batch_id].shape)))
+
+        self._now_batch_id += 1
+        self._now_batch_id %= self._batch_num
+        user_log("history %s." % (history.history))
+
+        self._train_10k.end()
+
     def train(self, train_dataset, remaining_time_budget=None):
         """model training on train_dataset.
 
@@ -239,6 +316,7 @@ class Model(object):
                      values should be binary.
         :param remaining_time_budget:
         """
+        user_log("train_start. remain %f sec" % (remaining_time_budget))
         if not self.initialized:
             self.initialize(train_dataset)
 
@@ -247,26 +325,17 @@ class Model(object):
 
         if self.model is None:
             self.init_model()
+            self.run_train()
+            return
 
-        callbacks = [tf.keras.callbacks.EarlyStopping(
-            monitor='val_loss', patience=3)]
+        train_runtime_timer = Timer()
+        while train_runtime_timer._total_time < 4*self._test_all.avg():
+            train_runtime_timer.start()
+            self.run_train()
+            train_runtime_timer.end()
 
-        # fit model
-        history = self.model.fit(
-            self.x_train,
-            ohe2cat(self.y_train),
-            # y_train,
-            epochs=5,
-            callbacks=callbacks,
-            validation_split=0.2,
-            # validation_data=(x_dev,y_dev),
-            verbose=2,  # Logs once per epoch.
-            batch_size=32,
-            shuffle=False)
-        print(str(type(self.x_train)) + " " + str(self.y_train.shape))
-        print(history.history)
-        if len(history.history['loss']) < 5:
-            self.done_training = True
+        self.validate()
+        self.check_if_end()
 
     def test(self, x_test, remaining_time_budget=None):
         """
@@ -278,6 +347,7 @@ class Model(object):
                  values should be binary or in the interval [0,1].
         """
         # tokenizing Chinese words
+        self._test_all.start()
         if self.metadata['language'] == 'ZH':
             x_test = clean_zh_text(x_test)
             x_test = list(map(_tokenize_chinese_words, x_test))
@@ -287,6 +357,8 @@ class Model(object):
         x_test = self.tokenizer.texts_to_sequences(x_test)
         x_test = sequence.pad_sequences(x_test, maxlen=self.max_length)
         result = self.model.predict(x_test)
-        print(result[0])
+        user_log(result[0])
+        self._test_all.end()
 
+        self.send_log()
         return result
