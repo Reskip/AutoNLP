@@ -1,7 +1,7 @@
 import os
 import gzip
 import re
-import jieba
+import jieba_fast as jieba
 import tensorflow as tf
 import numpy as np
 import time
@@ -15,7 +15,7 @@ from tensorflow.python.keras.preprocessing import text
 from tensorflow.python.keras.preprocessing import sequence
 
 from cnn import cnn_model
-from timer import Timer
+from timer import Timer, _Timer
 
 from keras.backend.tensorflow_backend import set_session
 config = tf.ConfigProto()
@@ -31,9 +31,11 @@ set_session(sess)
 MAX_SEQ_LENGTH = 500
 MAX_VOCAB_SIZE = 20000  # Limit the number of features. only top 20K features
 MAX_VOCAB_READ_FROM_EMBEDDING = 200000  # Limit number of wordvec load from dict
-MAX_VOCAB_STAT = 50000  # TODO
-BATCH_SIZE = 3000
+MAX_VOCAB_STAT = 50000
+BATCH_SIZE = 1000
 MAX_VALID_SIZE = 2000
+MAX_TRAIN_TIME = 240
+MIN_FIRST_TRAIN = 15
 
 
 def clean_en_text(dat):
@@ -140,6 +142,7 @@ class Model(object):
              "num_test_instances": 1000,
              "time_budget": 300}
         """
+
         self.done_training = False
         self.metadata = metadata
         self.train_output_path = train_output_path
@@ -153,42 +156,89 @@ class Model(object):
         self.y_train = None
         self.x_valid = None
         self.y_valid = None
+        self.x_test = None
         self.word_index = None
         self.num_features = None
         self.num_classes = None
         self.embedding_matrix = None
 
         self.initialized = False
+        self.round = 1
+        self.trans_x = None
+        self.trans_valid = False
 
         self._now_batch_id = 0
         self._batch_num = 0
         self._loss_history = list()
-        self._train_10k = Timer()
-        self._test_all = Timer()
-        self._validate = Timer()
+        self._timer = Timer()
         self._min_loss = 999999999.0
         self._not_imporove_round = 0
         user_log("__init__ done.")
+
+    def preprocess(self, i, overwritten=None):
+        work_ptr = self.x_train[i]
+        if overwritten is not None:
+            work_ptr = overwritten
+
+        if self.trans_x[i] is False or overwritten is not None:
+            if overwritten is None:
+                self.trans_x[i] = True
+
+            self._timer.start("train_transform")
+            if self.metadata['language'] == 'ZH':
+                work_ptr = clean_zh_text(work_ptr)
+                work_ptr = list(map(_tokenize_chinese_words, work_ptr))
+            else:
+                work_ptr = clean_en_text(work_ptr)
+
+            work_ptr = self.tokenizer.texts_to_sequences(work_ptr)
+            work_ptr = sequence.pad_sequences(work_ptr, maxlen=self.max_length)
+
+            if overwritten is None:
+                self.x_train[i] = work_ptr
+                user_log("Update trans of batch %d." % (i))
+            self._timer.end("train_transform")
+        return work_ptr
 
     def initialize(self, train_dataset):
         # why not init in __init__() ?
         # cause word index process need train_dataset, so init step should run
         # in first training step
         user_log("initialize start.")
+        self._timer.start("sequentialize")
         self.initialized = True
         self.x_train, self.y_train = train_dataset
 
+        self.x_train, self.y_train = shuffle(self.x_train, self.y_train)
+        self.x_train, self.x_valid, self.y_train, self.y_valid = train_test_split(
+            self.x_train, self.y_train, test_size=0.2)
+        self.x_valid = self.x_valid[:MAX_VALID_SIZE]
+        self.y_valid = self.y_valid[:MAX_VALID_SIZE]
+
+        self._batch_num = math.ceil(len(self.x_train) / (BATCH_SIZE * 1.0))
+        self.trans_x = [False for i in range(self._batch_num)]
+        self.x_train = [self.x_train[i*BATCH_SIZE:(i+1)*BATCH_SIZE] for i in range(self._batch_num)]
+        self.y_train = [self.y_train[i*BATCH_SIZE:(i+1)*BATCH_SIZE] for i in range(self._batch_num)]
+
+        x_stat = list()
+        index = 0
+        while index < self._batch_num and len(x_stat) < MAX_VOCAB_STAT:
+            x_stat.extend(self.x_train[index])
+            index += 1
+
         # tokenize Chinese words
         if self.metadata['language'] == 'ZH':
-            self.x_train = clean_zh_text(self.x_train)
-            self.x_train = list(map(_tokenize_chinese_words, self.x_train))
+            x_stat = clean_zh_text(x_stat)
+            x_stat = list(map(_tokenize_chinese_words, x_stat))
         else:
-            self.x_train = clean_en_text(self.x_train)
+            x_stat = clean_en_text(x_stat)
 
-        self.x_train, self.word_index, self.num_features, self.tokenizer,\
-            self.max_length = sequentialize_data(self.x_train)
+        _, self.word_index, self.num_features, self.tokenizer,\
+            self.max_length = sequentialize_data(x_stat)
         self.num_classes = self.metadata['class_num']
+        self._timer.end("sequentialize")
 
+        self._timer.start("load_word_vec")
         # loading pretrained embedding
         FT_DIR = '/app/embedding'
         fasttext_embeddings_index = {}
@@ -234,17 +284,13 @@ class Model(object):
                 self.embedding_matrix[i] = np.zeros(300)
                 cnt += 1
 
-        self.x_train, self.y_train = shuffle(self.x_train, self.y_train)
-        self.x_train, self.x_valid, self.y_train, self.y_valid = train_test_split(
-            self.x_train, self.y_train, test_size=0.2)
-        self._batch_num = math.ceil(len(self.x_train) / (BATCH_SIZE * 1.0))
-        self.x_train = [self.x_train[i*BATCH_SIZE:(i+1)*BATCH_SIZE] for i in range(self._batch_num)]
-        self.y_train = [self.y_train[i*BATCH_SIZE:(i+1)*BATCH_SIZE] for i in range(self._batch_num)]
+        self._timer.end("load_word_vec")
         user_log('fastText oov words: %s, correct words: %s, split to %d batch.'
             % (cnt, correct_cnt, self._batch_num))
 
     def init_model(self):
         # initialize model
+
         self.model = cnn_model(
             input_shape=self.x_train[0].shape[1:][0],
             num_classes=self.num_classes,
@@ -265,28 +311,37 @@ class Model(object):
             self.done_training = True
 
     def validate(self):
-        self._validate.start()
-        result = self.model.predict(self.x_valid[:MAX_VALID_SIZE])
-        loss = log_loss(self.y_valid[:MAX_VALID_SIZE], result)
+        if self.trans_valid is False:
+            self.x_valid = self.preprocess(0, self.x_valid)
+            self.trans_valid = True
+
+        self._timer.start("validate")
+        result = self.model.predict(self.x_valid)
+        loss = log_loss(self.y_valid, result)
         self._loss_history.append(loss)
         if loss < self._min_loss:
             self._min_loss = loss
             self._not_imporove_round = 0
         else:
             self._not_imporove_round += 1
-        self._validate.end()
+        self._timer.end("validate")
 
     def send_log(self):
         user_log("============================================")
-        user_log("Train avg time %f." % (self._train_10k.avg()))
-        user_log("Test avg time %f." % (self._test_all.avg()))
-        user_log("Validate avg time %f." % (self._validate.avg()))
+        user_log("Load word vec total time %f." % (self._timer.get("load_word_vec").avg()))
+        user_log("Sequentialize total time %f." % (self._timer.get("sequentialize").avg()))
+        user_log("Train avg time %f." % (self._timer.get("train_10k").avg()))
+        user_log("Test pred avg time %f." % (self._timer.get("test_pred").avg()))
+        user_log("Test trans total time %f." % (self._timer.get("test_transform").avg()))
+        user_log("Validate avg time %f." % (self._timer.get("validate").avg()))
+        user_log("Train trans total time %f." % (self._timer.get("train_transform")._total_time))
         user_log("Min loss %f." % (self._min_loss))
         user_log("Loss history %s." % (self._loss_history))
         user_log("============================================")
 
     def run_train(self):
-        self._train_10k.start()
+        self.preprocess(self._now_batch_id)
+        self._timer.start("train_10k")
         # fit model
         history = self.model.fit(
             self.x_train[self._now_batch_id],
@@ -303,7 +358,7 @@ class Model(object):
         self._now_batch_id %= self._batch_num
         user_log("history %s." % (history.history))
 
-        self._train_10k.end()
+        self._timer.end("train_10k")
 
     def train(self, train_dataset, remaining_time_budget=None):
         """model training on train_dataset.
@@ -317,6 +372,12 @@ class Model(object):
         :param remaining_time_budget:
         """
         user_log("train_start. remain %f sec" % (remaining_time_budget))
+        max_train_time = min(
+            MIN_FIRST_TRAIN * self.round,
+            5*self._timer.get("test_pred").avg() if self._timer.get("test_pred").avg() > 0 else 99999999,
+            MAX_TRAIN_TIME)
+        self.round += 1
+
         if not self.initialized:
             self.initialize(train_dataset)
 
@@ -324,18 +385,23 @@ class Model(object):
             return
 
         if self.model is None:
+            self.preprocess(0)
             self.init_model()
-            self.run_train()
-            return
 
-        train_runtime_timer = Timer()
-        while train_runtime_timer._total_time < 4*self._test_all.avg():
+        train_runtime_timer = _Timer()
+        while train_runtime_timer._total_time < max_train_time:
             train_runtime_timer.start()
             self.run_train()
             train_runtime_timer.end()
 
-        self.validate()
-        self.check_if_end()
+        user_log("Train finished. train_time_budget: %f, actually train: %f." % (
+            max_train_time,
+            train_runtime_timer._total_time
+        ))
+
+        if self.round > 2:
+            self.validate()
+            self.check_if_end()
 
     def test(self, x_test, remaining_time_budget=None):
         """
@@ -347,18 +413,22 @@ class Model(object):
                  values should be binary or in the interval [0,1].
         """
         # tokenizing Chinese words
-        self._test_all.start()
-        if self.metadata['language'] == 'ZH':
-            x_test = clean_zh_text(x_test)
-            x_test = list(map(_tokenize_chinese_words, x_test))
-        else:
-            x_test = clean_en_text(x_test)
+        if self.x_test is None:
+            self._timer.start("test_transform")
+            if self.metadata['language'] == 'ZH':
+                self.x_test = clean_zh_text(x_test)
+                self.x_test = list(map(_tokenize_chinese_words, self.x_test))
+            else:
+                self.x_test = clean_en_text(x_test)
 
-        x_test = self.tokenizer.texts_to_sequences(x_test)
-        x_test = sequence.pad_sequences(x_test, maxlen=self.max_length)
-        result = self.model.predict(x_test)
+            self.x_test = self.tokenizer.texts_to_sequences(self.x_test)
+            self.x_test = sequence.pad_sequences(self.x_test, maxlen=self.max_length)
+            self._timer.end("test_transform")
+
+        self._timer.start("test_pred")
+        result = self.model.predict(self.x_test)
         user_log(result[0])
-        self._test_all.end()
+        self._timer.end("test_pred")
 
         self.send_log()
         return result
