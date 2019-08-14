@@ -30,7 +30,7 @@ set_session(sess)
 
 MAX_SEQ_LENGTH = 500
 MAX_VOCAB_SIZE = 20000  # Limit the number of features. only top 20K features
-MAX_VOCAB_READ_FROM_EMBEDDING = 200000  # Limit number of wordvec load from dict
+MAX_VOCAB_READ_FROM_EMBEDDING = 500000  # Limit number of wordvec load from dict
 MAX_VOCAB_STAT = 50000
 BATCH_SIZE = 1000
 MAX_VALID_SIZE = 2000
@@ -133,6 +133,38 @@ class Model(object):
         see `https://aclweb.org/anthology/D14-1181` for more information.
     """
 
+    def load_word_vec(self):
+        self._timer.start("load_word_vec")
+        # loading pretrained embedding
+        FT_DIR = '/app/embedding'
+
+        if self.metadata['language'] == 'ZH':
+            f = gzip.open(os.path.join(FT_DIR, 'cc.zh.300.vec.gz'), 'rb')
+        elif self.metadata['language'] == 'EN':
+            f = gzip.open(os.path.join(FT_DIR, 'cc.en.300.vec.gz'), 'rb')
+        else:
+            raise ValueError('Unexpected embedding path:'
+                             ' {unexpected_embedding}. '.format(
+                                 unexpected_embedding=FT_DIR))
+
+        vocab_count = 0
+        for line in f:
+            if vocab_count > MAX_VOCAB_READ_FROM_EMBEDDING:
+                break
+            vocab_count += 1
+
+            values = line.strip().split()
+            if self.metadata['language'] == 'ZH':
+                word = values[0].decode('utf8')
+            else:
+                word = bytes.decode(values[0])
+            coefs = np.asarray(values[1:], dtype='float32')
+            self.fasttext_embeddings_index[word] = coefs
+
+        self._timer.end("load_word_vec")
+        user_log('Found %s fastText word vectors.' %
+                len(self.fasttext_embeddings_index))
+
     def __init__(self, metadata, train_output_path="./", test_input_path="./"):
         """ Initialization for model
         :param metadata: a dict formed like:
@@ -161,6 +193,7 @@ class Model(object):
         self.num_features = None
         self.num_classes = None
         self.embedding_matrix = None
+        self.fasttext_embeddings_index = dict()
 
         self.initialized = False
         self.round = 1
@@ -173,6 +206,7 @@ class Model(object):
         self._timer = Timer()
         self._min_loss = 999999999.0
         self._not_imporove_round = 0
+        self.load_word_vec()
         user_log("__init__ done.")
 
     def preprocess(self, i, overwritten=None):
@@ -238,35 +272,7 @@ class Model(object):
         self.num_classes = self.metadata['class_num']
         self._timer.end("sequentialize")
 
-        self._timer.start("load_word_vec")
-        # loading pretrained embedding
-        FT_DIR = '/app/embedding'
-        fasttext_embeddings_index = {}
-        if self.metadata['language'] == 'ZH':
-            f = gzip.open(os.path.join(FT_DIR, 'cc.zh.300.vec.gz'), 'rb')
-        elif self.metadata['language'] == 'EN':
-            f = gzip.open(os.path.join(FT_DIR, 'cc.en.300.vec.gz'), 'rb')
-        else:
-            raise ValueError('Unexpected embedding path:'
-                             ' {unexpected_embedding}. '.format(
-                                 unexpected_embedding=FT_DIR))
-
-        vocab_count = 0
-        for line in f:
-            if vocab_count > MAX_VOCAB_READ_FROM_EMBEDDING:
-                break
-            vocab_count += 1
-
-            values = line.strip().split()
-            if self.metadata['language'] == 'ZH':
-                word = values[0].decode('utf8')
-            else:
-                word = bytes.decode(values[0])
-            coefs = np.asarray(values[1:], dtype='float32')
-            fasttext_embeddings_index[word] = coefs
-
-        user_log('Found %s fastText word vectors.' %
-                len(fasttext_embeddings_index))
+        self._timer.start("embedding_mapping")
         # embedding lookup
         EMBEDDING_DIM = 300
         self.embedding_matrix = np.zeros((self.num_features, EMBEDDING_DIM))
@@ -275,7 +281,7 @@ class Model(object):
         for word, i in self.word_index.items():
             if i >= self.num_features:
                 continue
-            embedding_vector = fasttext_embeddings_index.get(word)
+            embedding_vector = self.fasttext_embeddings_index.get(word)
             if embedding_vector is not None:
                 # words not found in embedding index will be all-zeros.
                 self.embedding_matrix[i] = embedding_vector
@@ -283,8 +289,7 @@ class Model(object):
             else:
                 self.embedding_matrix[i] = np.zeros(300)
                 cnt += 1
-
-        self._timer.end("load_word_vec")
+        self._timer.end("embedding_mapping")
         user_log('fastText oov words: %s, correct words: %s, split to %d batch.'
             % (cnt, correct_cnt, self._batch_num))
 
@@ -296,8 +301,8 @@ class Model(object):
             num_classes=self.num_classes,
             num_features=self.num_features,
             embedding_matrix=self.embedding_matrix,
-            filters=128,
-            kernel_sizes=[2, 3, 4, 5],
+            filters=64,
+            kernel_sizes=[3, 4, 5],
             dropout_rate=0.4,
             embedding_trainable=True,
             l2_lambda=1.0)
@@ -335,6 +340,7 @@ class Model(object):
         user_log("Test trans total time %f." % (self._timer.get("test_transform").avg()))
         user_log("Validate avg time %f." % (self._timer.get("validate").avg()))
         user_log("Train trans total time %f." % (self._timer.get("train_transform")._total_time))
+        user_log("Mapping embedding total time %f." % (self._timer.get("embedding_mapping")._total_time))
         user_log("Min loss %f." % (self._min_loss))
         user_log("Loss history %s." % (self._loss_history))
         user_log("============================================")
